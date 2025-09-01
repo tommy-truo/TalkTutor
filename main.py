@@ -1,12 +1,16 @@
-from app_gui import AppGUI
-from app_state import AppState
+from gui.app_gui import AppGUI
+from controller import Controller
 import tkinter as tk
+
+import time
 
 def main():
     root = tk.Tk()
-    app_state = AppState()
-    app = AppGUI(root, app_state)
+    controller = Controller()
+    app = AppGUI(root, controller)
     app.run()
+    
+
 
 if __name__ == "__main__":
     main()
