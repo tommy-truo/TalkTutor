@@ -1,32 +1,28 @@
 from faster_whisper import WhisperModel
 from torch import cuda
-import threading
 import numpy as np
+import queue as q
 import time
 
 
 class Transcriber:
-    def __init__(self, state, model_size="large-v3", samplerate=16000, 
-                 chunk_duration=3):
-        self.state = state
-        self.device_type = "cuda" if cuda.is_available() else "cpu"
-        self.model = self.create_model(model_size)
-        self.samplerate = samplerate
+    def __init__(self, audio_queue=None, output_queue=None,
+                 max_model_size="large-v3", min_model_size = "small", 
+                 audio_samplerate=16000, chunk_duration=2):
+        self.audio_queue = audio_queue if audio_queue is not None else q.Queue()
+        self.output_queue = output_queue if output_queue is not None else q.Queue()
+        
+        self.max_model_size = max_model_size
+        self.min_model_size = min_model_size
+        self.device = "cuda" if cuda.is_available() else "cpu"
+        self.model = self.create_model(self.max_model_size)
 
-        self.buffer = np.zeros(0, dtype=np.float32)
-
+        self.audio_samplerate = audio_samplerate
         self.chunk_duration = chunk_duration
-
-        self.chunk_buffer_size = chunk_duration * samplerate
-
-        self.last_end_time = 0.0
-        self.time_offset = 0.0
-
-        self.transcription_thread = None
 
 
     def create_model(self, model_size):
-        MODEL_ORDER = [
+        VALID_MODELS = [
         "tiny", "tiny.en", 
         "base", "base.en", 
         "small", "small.en", 
@@ -36,109 +32,108 @@ class Transcriber:
         "large-v3"
         ]
 
-        if model_size not in MODEL_ORDER:
-            raise ValueError(f"Invalid model size '{model_size}'. Valid options are: {', '.join(MODEL_ORDER)}")
+        if model_size not in VALID_MODELS:
+            raise ValueError(f"Invalid model size '{model_size}'. Valid options are: {', '.join(VALID_MODELS)}")
             
         if cuda.is_available():
-            print("using cuda")
+            print("Creating Transcriber model utilizing CUDA.")
             model = WhisperModel(model_size, device="cuda", compute_type="float32")
-            print("created model using cuda")
         else:
-            print("using cpu")
-            index = MODEL_ORDER.index(model_size)
-            if index < MODEL_ORDER.index("medium"):
+            print("Creating Transcriber model utilizing CPU.")
+            index = VALID_MODELS.index(model_size)
+            if index < VALID_MODELS.index("large-v1"):
                 model = WhisperModel(model_size, device="cpu", compute_type="int8")
             else:
-                print("Model size '" + model_size + "' is too large for CPU computation. Using 'small' instead.")
-                model = WhisperModel("small", device="cpu", compute_type="int8")
-            print("created model using cpu")
+                print("Model size '" + model_size + "' is too large for CPU computation. Using '" + self.min_model_size + "' instead.")
+                model = WhisperModel(self.min_model_size, device="cpu", compute_type="int8")
+        
+        print("Created Transcriber model.")
 
         return model
-    
+
 
     def clear_buffer(self):
         self.buffer = np.zeros(0, dtype=np.float32)
-
-    def reset_times(self):
-        self.last_end_time = 0.0
-        self.time_offset = 0.0
-
-    def reset_state(self):
-        self.clear_buffer()
-        self.reset_times()
-        self.state.reset_transcript()
     
     
-    def transcribe_batch(self, buffer=None):
-        if buffer is None:
-            buffer = self.buffer
-        
-        if len(buffer) > 0:
-            segments, info = self.model.transcribe(buffer)
-            transcribed_text = " ".join([segment.text for segment in segments])
-            self.state.append_transcript(transcribed_text)
-
-
-    def transcribe_chunked(self, buffer=None):
-        if buffer is None:
-            buffer = self.buffer
-
-        while len(buffer) >= self.chunk_buffer_size:
-            chunk_to_process = buffer[:self.chunk_buffer_size]
-            buffer = buffer[self.chunk_buffer_size:]
-
-            segments, info = self.model.transcribe(chunk_to_process)
-
+    def transcribe(self, audio):
+        if len(audio) > 0 and audio is not None:
+            segments, info = self.model.transcribe(
+                audio=audio,
+                no_repeat_ngram_size=2,
+                vad_filter=True
+            )
+            transcribed_words = []
+            
             for segment in segments:
-                if hasattr(segment, "avg_logprob") and hasattr(segment, "compression_ratio"):
-                    if segment.avg_logprob < -1.0 or segment.compression_ratio > 2.4:
-                        continue
+                if segment.no_speech_prob < 0.7:
+                    transcribed_words.append(segment.text)
+
+            output_string = " ".join([word for word in transcribed_words])
                 
-                absolute_start = segment.start + self.time_offset
-                absolute_end = segment.end + self.time_offset
+            return output_string
 
-                if absolute_start >= self.last_end_time:
-                    self.state.append_transcript(segment.text)
-                    self.last_end_time = absolute_end
 
-            self.time_offset += (self.chunk_buffer_size) / self.samplerate
+    def transcribe_to_queue(self, audio, output_queue=None):
+        if output_queue is None:
+            output_queue = self.output_queue
+        
+        if len(audio) > 0 and audio is not None:
+            segments, info = self.model.transcribe(
+                audio=audio,
+                no_repeat_ngram_size=2,
+                vad_filter=True
+            )
+            
+            for segment in segments:
+                if segment.no_speech_prob < 0.7:
+                    self.output_queue.put(segment.text)
 
-        return buffer
+            return self.output_queue
     
 
-    def transcribe_wrapper(self, buffer=None):
-        if buffer is None:
-            buffer = self.buffer
+    def live_transcribe(self, audio_queue=None, output_queue=None):
+        if audio_queue is None:
+            audio_queue = self.audio_queue
+        if output_queue is None:
+            output_queue = self.output_queue
 
-        self.reset_times()
-        self.state.reset_transcript()
+        buffer = []
+        accumulated_samples = 0
+        chunk_size = self.chunk_duration * self.audio_samplerate
 
-        while self.state.get_is_recording() or not self.state.is_audio_empty():
-            chunk = self.state.get_next_chunk(timeout=0.5)
+        transcribed_words = []
 
-            if chunk is not None and len(chunk) > 0:
-                buffer = np.concatenate([buffer, chunk])
+        while True:
+            try:
+                chunk = audio_queue.get(timeout=self.chunk_duration*3)  #wait for an audio chunk
+            except q.Empty:
+                print("Warning: Failed to get chunk from audio queue. Ending transcription.")
+                break
+
+            if chunk is None:
+                break #None is the stop signal for audio recording
+
+            buffer.append(chunk)
+            accumulated_samples += chunk.shape[0]
+
+            if accumulated_samples >= chunk_size:
+                concatenated_buffer = np.concatenate(buffer, axis=0)
+                audio_to_transcribe = concatenated_buffer[:chunk_size]
+                leftover_audio = concatenated_buffer[chunk_size:]
+
+                buffer = [leftover_audio] if leftover_audio.size > 0 else []
+                accumulated_samples = leftover_audio.shape[0]
+
+                segments, info = self.model.transcribe(
+                    audio=audio_to_transcribe,
+                    no_repeat_ngram_size=2,
+                    vad_filter=True
+                )
             
-            while len(buffer) >= self.chunk_buffer_size:
-                buffer = self.transcribe_chunked(buffer)
-            
-            time.sleep(0.01)
+                for segment in segments:
+                    if segment.no_speech_prob < 0.7:
+                        self.output_queue.put(segment.text)
+                        transcribed_words.append(segment.text)
 
-        if len(buffer) > 0:
-            self.transcribe_batch(buffer)
-
-
-    def start_transcription_thread(self, buffer=None):
-        if self.transcription_thread is not None and self.transcription_thread.is_alive():
-            print("Transcription thread is already running.")
-            return self.transcription_thread
-        
-        self.reset_state()
-        thread = threading.Thread(target=self.transcribe_wrapper, args=(buffer,), daemon=True)
-        self.state.set_transcribe_time(time.time())
-        thread.start()
-        self.transcription_thread = thread
-
-
-    def get_thread(self):
-        return self.transcription_thread
+        return self.output_queue
